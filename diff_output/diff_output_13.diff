@@ -1,0 +1,173 @@
+--- ./sample_code/variation1/src/main/java/com/example/glue.java
++++ ./sample_code/variation3/src/main/java/com/example/glue.java
+@@ -8,82 +8,122 @@
+ import com.amazonaws.services.dynamodbv2.document.Item;
+ import com.amazonaws.services.glue.GlueContext;
+ import com.amazonaws.services.glue.util.JsonOptions;
+-import com.amazonaws.services.kinesis.AmazonKinesis;
+-import com.amazonaws.services.kinesis.AmazonKinesisClientBuilder;
+-import com.amazonaws.services.kinesis.model.GetRecordsRequest;
+-import com.amazonaws.services.kinesis.model.GetRecordsResult;
+-import com.amazonaws.services.kinesis.model.GetShardIteratorRequest;
+-import com.amazonaws.services.kinesis.model.GetShardIteratorResult;
+-import com.amazonaws.services.kinesis.model.ShardIteratorType;
++import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
++import com.amazonaws.services.kinesis.clientlibrary.lib.worker.KinesisClientLibConfiguration;
++import com.amazonaws.services.kinesis.clientlibrary.lib.worker.Worker;
++import com.amazonaws.services.kinesis.clientlibrary.interfaces.v2.IRecordProcessor;
++import com.amazonaws.services.kinesis.clientlibrary.interfaces.v2.IRecordProcessorFactory;
++import com.amazonaws.services.kinesis.clientlibrary.types.ShutdownReason;
++import com.amazonaws.services.kinesis.clientlibrary.types.ProcessRecordsInput;
++import com.amazonaws.services.kinesis.model.Record;
+ import org.apache.spark.api.java.JavaSparkContext;
+ import org.apache.spark.sql.SparkSession;
+ import org.apache.spark.sql.Dataset;
+ import org.apache.spark.sql.Row;
+ import org.apache.spark.sql.functions;
+-import scala.collection.JavaConverters;
+-
++import java.nio.charset.StandardCharsets;
+ import java.util.List;
+ import java.util.Map;
++import java.util.UUID;
++import java.util.stream.Collectors;
+ 
+-public class GlueJob {
+-
++public class GlueJobKCL {
+     public static void main(String[] args) {
+         // Initialize Spark session and Glue context
+-        SparkSession spark = SparkSession.builder().appName("GlueJob").getOrCreate();
++        SparkSession spark = SparkSession.builder().appName("GlueJobKCL").getOrCreate();
+         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
+         GlueContext glueContext = new GlueContext(jsc);
+ 
+         // Kinesis stream configuration
+         String kinesisStreamName = "your-kinesis-stream-name";
+         String regionName = "your-region";
++        String applicationName = "your-application-name";
+         
+         // DynamoDB table configuration
+         String dynamodbTableName = "your-dynamodb-table-name";
+         String dynamodbRegionName = "your-region";
+ 
+-        // Create Kinesis client
+-        AmazonKinesis kinesisClient = AmazonKinesisClientBuilder.standard()
+-                .withRegion(regionName)
++        // Create Kinesis client configuration
++        KinesisClientLibConfiguration kclConfig = new KinesisClientLibConfiguration(
++                applicationName,
++                kinesisStreamName,
++                null,
++                UUID.randomUUID().toString()
++        ).withRegionName(regionName)
++         .withInitialPositionInStream(InitialPositionInStream.LATEST);
++
++        // Create and start Kinesis worker
++        Worker worker = new Worker.Builder()
++                .recordProcessorFactory(new RecordProcessorFactory(spark, dynamodbTableName, dynamodbRegionName))
++                .config(kclConfig)
+                 .build();
+ 
+-        // Get shard iterator
+-        GetShardIteratorRequest shardIteratorRequest = new GetShardIteratorRequest()
+-                .withStreamName(kinesisStreamName)
+-                .withShardId("shardId-000000000000")
+-                .withShardIteratorType(ShardIteratorType.LATEST);
+-        GetShardIteratorResult shardIteratorResult = kinesisClient.getShardIterator(shardIteratorRequest);
+-        String shardIterator = shardIteratorResult.getShardIterator();
++        worker.run();
++    }
+ 
+-        // Get records from Kinesis
+-        GetRecordsRequest recordsRequest = new GetRecordsRequest().withShardIterator(shardIterator);
+-        GetRecordsResult recordsResult = kinesisClient.getRecords(recordsRequest);
+-        List<Record> records = recordsResult.getRecords();
++    private static class RecordProcessorFactory implements IRecordProcessorFactory {
++        private SparkSession spark;
++        private String dynamodbTableName;
++        private String dynamodbRegionName;
+ 
+-        // Process records with Spark
+-        List<String> jsonRecords = records.stream()
+-                .map(record -> new String(record.getData().array()))
+-                .collect(Collectors.toList());
++        public RecordProcessorFactory(SparkSession spark, String dynamodbTableName, String dynamodbRegionName) {
++            this.spark = spark;
++            this.dynamodbTableName = dynamodbTableName;
++            this.dynamodbRegionName = dynamodbRegionName;
++        }
+ 
+-        Dataset<Row> dataFrame = spark.read().json(jsc.parallelize(jsonRecords));
+-        
+-        // Example transformation
+-        Dataset<Row> transformedDataFrame = dataFrame.filter(dataFrame.col("column").equalTo("value"));
++        @Override
++        public IRecordProcessor createProcessor() {
++            return new RecordProcessor(spark, dynamodbTableName, dynamodbRegionName);
++        }
++    }
+ 
+-        // Write to DynamoDB
+-        AmazonDynamoDB dynamoDBClient = AmazonDynamoDBClientBuilder.standard()
+-                .withRegion(dynamodbRegionName)
+-                .build();
+-        DynamoDB dynamoDB = new DynamoDB(dynamoDBClient);
+-        Table table = dynamoDB.getTable(dynamodbTableName);
++    private static class RecordProcessor implements IRecordProcessor {
++        private SparkSession spark;
++        private String dynamodbTableName;
++        private String dynamodbRegionName;
+ 
+-        transformedDataFrame.foreach(row -> {
+-            Map<String, Object> map = row.getValuesMap(row.schema().fieldNames());
+-            Item item = new Item();
+-            map.forEach(item::with);
+-            PutItemOutcome outcome = table.putItem(item);
+-        });
++        public RecordProcessor(SparkSession spark, String dynamodbTableName, String dynamodbRegionName) {
++            this.spark = spark;
++            this.dynamodbTableName = dynamodbTableName;
++            this.dynamodbRegionName = dynamodbRegionName;
++        }
+ 
+-        // Stop Spark session
+-        spark.stop();
++        @Override
++        public void initialize(String shardId) {
++            // Initialization logic if needed
++        }
++
++        @Override
++        public void processRecords(ProcessRecordsInput input) {
++            List<Record> records = input.getRecords();
++            List<String> jsonRecords = records.stream()
++                    .map(record -> new String(record.getData().array(), StandardCharsets.UTF_8))
++                    .collect(Collectors.toList());
++
++            Dataset<Row> dataFrame = spark.read().json(jsonRecords);
++            
++            // Example transformation
++            Dataset<Row> transformedDataFrame = dataFrame.filter(dataFrame.col("column").equalTo("value"));
++
++            // Write to DynamoDB
++            AmazonDynamoDB dynamoDBClient = AmazonDynamoDBClientBuilder.standard()
++                    .withRegion(dynamodbRegionName)
++                    .build();
++            DynamoDB dynamoDB = new DynamoDB(dynamoDBClient);
++            Table table = dynamoDB.getTable(dynamodbTableName);
++
++            transformedDataFrame.foreach(row -> {
++                Map<String, Object> map = row.getValuesMap(row.schema().fieldNames());
++                Item item = new Item();
++                map.forEach(item::with);
++                PutItemOutcome outcome = table.putItem(item);
++            });
++        }
++
++        @Override
++        public void shutdown(ShutdownReason reason) {
++            // Shutdown logic if needed
++        }
+     }
+ }
